@@ -20,7 +20,3 @@ std = []
 [dev-dependencies]
 pico-sys = "0.0.1"
 
-[profile.bench]
-lto = true
-codegen-units = 1
-opt-level = 3

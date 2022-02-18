@@ -29,7 +29,8 @@ use core::mem::{self, MaybeUninit};
 use iter::Bytes;
 
 mod iter;
-#[macro_use] mod macros;
+#[macro_use]
+mod macros;
 mod simd;
 
 /// Determines if byte is a token char.
@@ -207,7 +208,7 @@ pub enum Status<T> {
     /// The completed result.
     Complete(T),
     /// A partial result.
-    Partial
+    Partial,
 }
 
 impl<T> Status<T> {
@@ -331,7 +332,7 @@ impl ParserConfig {
 ///         Some(ref path) => {
 ///             // check router for path.
 ///             // /404 doesn't exist? we could stop parsing
-///         },
+///         }
 ///         None => {
 ///             // must read more and parse again
 ///         }
@@ -347,7 +348,13 @@ pub struct Request<'headers, 'buf: 'headers> {
     /// The request version, such as `HTTP/1.1`.
     pub version: Option<u8>,
     /// The request headers.
-    pub headers: &'headers mut [Header<'buf>]
+    pub headers: &'headers mut [Header<'buf>],
+    /// where the token is
+    pub token_from_to: (usize, usize),
+    /// where the path is
+    pub path_from_to: (usize, usize),
+    /// where the headers each
+    pub headers_from_to: Vec<(usize, usize)>,
 }
 
 impl<'h, 'b> Request<'h, 'b> {
@@ -358,7 +365,10 @@ impl<'h, 'b> Request<'h, 'b> {
             method: None,
             path: None,
             version: None,
-            headers: headers,
+            headers,
+            token_from_to: (0, 0),
+            path_from_to: (0, 0),
+            headers_from_to: Vec::new(),
         }
     }
 
@@ -371,12 +381,19 @@ impl<'h, 'b> Request<'h, 'b> {
         buf: &'b [u8],
         mut headers: &'h mut [MaybeUninit<Header<'b>>],
     ) -> Result<usize> {
-    let orig_len = buf.len();
+        let orig_len = buf.len();
         let mut bytes = Bytes::new(buf);
         complete!(skip_empty_lines(&mut bytes));
+        let token_from = orig_len - bytes.len();
         self.method = Some(complete!(parse_token(&mut bytes)));
+        let token_to = orig_len - bytes.len()-1;
+
         self.path = Some(complete!(parse_uri(&mut bytes)));
+        let path_to = orig_len - bytes.len()-1;
+
         self.version = Some(complete!(parse_version(&mut bytes)));
+
+
         newline!(bytes);
 
         let len = orig_len - bytes.len();
@@ -387,6 +404,9 @@ impl<'h, 'b> Request<'h, 'b> {
         ));
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         self.headers = unsafe { assume_init_slice(headers) };
+        self.token_from_to = (token_from,token_to);
+        self.path_from_to = (token_to,path_to);
+
 
         Ok(Status::Complete(len + headers_len))
     }
@@ -407,7 +427,7 @@ impl<'h, 'b> Request<'h, 'b> {
                     // put the original headers back
                     self.headers = &mut *(headers as *mut [Header]);
                     other
-                },
+                }
             }
         }
     }
@@ -422,15 +442,15 @@ fn skip_empty_lines(bytes: &mut Bytes) -> Result<()> {
                 // there's `\r`, so it's safe to bump 1 pos
                 unsafe { bytes.bump() };
                 expect!(bytes.next() == b'\n' => Err(Error::NewLine));
-            },
+            }
             Some(b'\n') => {
                 // there's `\n`, so it's safe to bump 1 pos
                 unsafe { bytes.bump(); }
-            },
+            }
             Some(..) => {
                 bytes.slice();
                 return Ok(Status::Complete(()));
-            },
+            }
             None => return Ok(Status::Partial)
         }
     }
@@ -450,7 +470,7 @@ pub struct Response<'headers, 'buf: 'headers> {
     /// Contains an empty string if the reason-phrase was missing or contained invalid characters.
     pub reason: Option<&'buf str>,
     /// The response headers.
-    pub headers: &'headers mut [Header<'buf>]
+    pub headers: &'headers mut [Header<'buf>],
 }
 
 impl<'h, 'b> Response<'h, 'b> {
@@ -482,7 +502,7 @@ impl<'h, 'b> Response<'h, 'b> {
                     // put the original headers back
                     self.headers = &mut *(headers as *mut [Header]);
                     other
-                },
+                }
             }
         }
     }
@@ -514,12 +534,12 @@ impl<'h, 'b> Response<'h, 'b> {
             b' ' => {
                 bytes.slice();
                 self.reason = Some(complete!(parse_reason(&mut bytes)));
-            },
+            }
             b'\r' => {
                 expect!(bytes.next() == b'\n' => Err(Error::Status));
                 bytes.slice();
                 self.reason = Some("");
-            },
+            }
             b'\n' => {
                 bytes.slice();
                 self.reason = Some("");
@@ -592,7 +612,7 @@ fn parse_version(bytes: &mut Bytes) -> Result<u8> {
             b'1' => 1,
             _ => return Err(Error::Version)
         };
-        return Ok(Status::Complete(v))
+        return Ok(Status::Complete(v));
     }
 
     // else (but not in `else` because of borrow checker)
@@ -748,6 +768,7 @@ unsafe fn deinit_slice_mut<'a, 'b, T>(s: &'a mut &'b mut [T]) -> &'a mut &'b mut
     let s = s as *mut &mut [MaybeUninit<T>];
     &mut *s
 }
+
 unsafe fn assume_init_slice<'a, T>(s: &'a mut [MaybeUninit<T>]) -> &'a mut [T] {
     let s: *mut [MaybeUninit<T>] = s;
     let s = s as *mut [T];
@@ -768,7 +789,6 @@ fn parse_headers_iter_uninit<'a, 'b>(
     bytes: &'b mut Bytes<'a>,
     config: &ParserConfig,
 ) -> Result<usize> {
-
     /* Flow of this function is pretty complex, especially with macros,
      * so this struct makes sure we shrink `headers` to only parsed ones.
      * Comparing to previous code, this only may introduce some additional
@@ -885,7 +905,7 @@ fn parse_headers_iter_uninit<'a, 'b>(
                                     // but it's not whitespace, so it's probably another
                                     // header or the final line return. This header is thus
                                     // empty.
-                                },
+                                }
                             }
                         }
 
@@ -963,7 +983,7 @@ fn parse_headers_iter_uninit<'a, 'b>(
                             // but it's not a space, so it's probably another
                             // header or the final line return. We are thus done
                             // with this current header.
-                        },
+                        }
                     }
                 }
 
@@ -981,7 +1001,7 @@ fn parse_headers_iter_uninit<'a, 'b>(
             .rposition(|b| *b != b' ' && *b != b'\t' && *b != b'\r' && *b != b'\n')
         {
             // There is at least one non-whitespace character.
-            &value_slice[0..last_visible+1]
+            &value_slice[0..last_visible + 1]
         } else {
             // There is no non-whitespace character. This can only happen when value_slice is
             // empty.
@@ -1011,7 +1031,7 @@ fn parse_headers_iter_uninit<'a, 'b>(
 ///            Ok(httparse::Status::Complete((3, 4))));
 /// ```
 pub fn parse_chunk_size(buf: &[u8])
-    -> result::Result<Status<(usize, u64)>, InvalidChunkSize> {
+                        -> result::Result<Status<(usize, u64)>, InvalidChunkSize> {
     const RADIX: u64 = 16;
     let mut bytes = Bytes::new(buf);
     let mut size = 0;
@@ -1021,15 +1041,15 @@ pub fn parse_chunk_size(buf: &[u8])
     loop {
         let b = next!(bytes);
         match b {
-            b'0' ..= b'9' if in_chunk_size => {
+            b'0'..=b'9' if in_chunk_size => {
                 if count > 15 {
                     return Err(InvalidChunkSize);
                 }
                 count += 1;
                 size *= RADIX;
                 size += (b - b'0') as u64;
-            },
-            b'a' ..= b'f' if in_chunk_size => {
+            }
+            b'a'..=b'f' if in_chunk_size => {
                 if count > 15 {
                     return Err(InvalidChunkSize);
                 }
@@ -1037,7 +1057,7 @@ pub fn parse_chunk_size(buf: &[u8])
                 size *= RADIX;
                 size += (b + 10 - b'a') as u64;
             }
-            b'A' ..= b'F' if in_chunk_size => {
+            b'A'..=b'F' if in_chunk_size => {
                 if count > 15 {
                     return Err(InvalidChunkSize);
                 }
@@ -1077,7 +1097,7 @@ pub fn parse_chunk_size(buf: &[u8])
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, Response, Status, EMPTY_HEADER, parse_chunk_size};
+    use super::{EMPTY_HEADER, parse_chunk_size, Request, Response, Status};
 
     const NUM_OF_HEADERS: usize = 4;
 

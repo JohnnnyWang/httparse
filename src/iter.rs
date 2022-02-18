@@ -1,16 +1,19 @@
 use core::slice;
 
+
 pub struct Bytes<'a> {
     slice: &'a [u8],
-    pos: usize
+    pos: usize,
+    pub reasons:Vec<(usize,usize)>
 }
 
 impl<'a> Bytes<'a> {
     #[inline]
     pub fn new(slice: &'a [u8]) -> Bytes<'a> {
         Bytes {
-            slice: slice,
-            pos: 0
+            slice,
+            pos: 0,
+            reasons:Vec::new()
         }
     }
 
@@ -34,6 +37,8 @@ impl<'a> Bytes<'a> {
     #[inline]
     pub unsafe fn advance(&mut self, n: usize) {
         debug_assert!(self.pos + n <= self.slice.len(), "overflow");
+
+        self.reasons.push((self.pos,self.pos+n));
         self.pos += n;
     }
 
