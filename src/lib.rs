@@ -354,7 +354,11 @@ pub struct Request<'headers, 'buf: 'headers> {
     /// where the path is
     pub path_from_to: (usize, usize),
     /// where the headers each
-    pub headers_from_to: Vec<(usize, usize)>,
+    pub headers_from_to: Vec<(usize, usize, usize)>,
+    /// before header len
+    pub len: usize,
+    /// header len
+    pub header_len: usize,
 }
 
 impl<'h, 'b> Request<'h, 'b> {
@@ -369,6 +373,8 @@ impl<'h, 'b> Request<'h, 'b> {
             token_from_to: (0, 0),
             path_from_to: (0, 0),
             headers_from_to: Vec::new(),
+            len: 0,
+            header_len: 0,
         }
     }
 
@@ -386,10 +392,10 @@ impl<'h, 'b> Request<'h, 'b> {
         complete!(skip_empty_lines(&mut bytes));
         let token_from = orig_len - bytes.len();
         self.method = Some(complete!(parse_token(&mut bytes)));
-        let token_to = orig_len - bytes.len()-1;
+        let token_to = orig_len - bytes.len() - 1;
 
         self.path = Some(complete!(parse_uri(&mut bytes)));
-        let path_to = orig_len - bytes.len()-1;
+        let path_to = orig_len - bytes.len() - 1;
 
         self.version = Some(complete!(parse_version(&mut bytes)));
 
@@ -397,17 +403,18 @@ impl<'h, 'b> Request<'h, 'b> {
         newline!(bytes);
 
         let len = orig_len - bytes.len();
-        let headers_len = complete!(parse_headers_iter_uninit(
+        let (headers_len, header_position_vec) = complete!(parse_headers_iter_uninit(
             &mut headers,
             &mut bytes,
             &ParserConfig::default(),
         ));
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         self.headers = unsafe { assume_init_slice(headers) };
-        self.token_from_to = (token_from,token_to);
-        self.path_from_to = (token_to,path_to);
-
-
+        self.token_from_to = (token_from, token_to);
+        self.path_from_to = (token_to, path_to);
+        self.headers_from_to = header_position_vec;
+        self.len = len;
+        self.header_len = headers_len;
         Ok(Status::Complete(len + headers_len))
     }
 
@@ -549,7 +556,7 @@ impl<'h, 'b> Response<'h, 'b> {
 
 
         let len = orig_len - bytes.len();
-        let headers_len = complete!(parse_headers_iter_uninit(
+        let (headers_len, _) = complete!(parse_headers_iter_uninit(
             &mut headers,
             &mut bytes,
             config
@@ -745,7 +752,7 @@ pub fn parse_headers<'b: 'h, 'h>(
     mut dst: &'h mut [Header<'b>],
 ) -> Result<(usize, &'h [Header<'b>])> {
     let mut iter = Bytes::new(src);
-    let pos = complete!(parse_headers_iter(&mut dst, &mut iter, &ParserConfig::default()));
+    let (pos, _) = complete!(parse_headers_iter(&mut dst, &mut iter, &ParserConfig::default()));
     Ok(Status::Complete((pos, dst)))
 }
 
@@ -754,7 +761,7 @@ fn parse_headers_iter<'a, 'b>(
     headers: &mut &mut [Header<'a>],
     bytes: &'b mut Bytes<'a>,
     config: &ParserConfig,
-) -> Result<usize> {
+) -> Result<(usize, Vec<(usize, usize, usize)>)> {
     parse_headers_iter_uninit(
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         unsafe { deinit_slice_mut(headers) },
@@ -788,7 +795,7 @@ fn parse_headers_iter_uninit<'a, 'b>(
     headers: &mut &mut [MaybeUninit<Header<'a>>],
     bytes: &'b mut Bytes<'a>,
     config: &ParserConfig,
-) -> Result<usize> {
+) -> Result<(usize, Vec<(usize, usize, usize)>)> {
     /* Flow of this function is pretty complex, especially with macros,
      * so this struct makes sure we shrink `headers` to only parsed ones.
      * Comparing to previous code, this only may introduce some additional
@@ -818,15 +825,16 @@ fn parse_headers_iter_uninit<'a, 'b>(
 
     let mut iter = autoshrink.headers.iter_mut();
 
+    let mut header_position_vec = Vec::new();
     'headers: loop {
         // a newline here means the head is over!
         let b = next!(bytes);
         if b == b'\r' {
             expect!(bytes.next() == b'\n' => Err(Error::NewLine));
-            result = Ok(Status::Complete(count + bytes.pos()));
+            result = Ok(Status::Complete((count + bytes.pos(), header_position_vec)));
             break;
         } else if b == b'\n' {
-            result = Ok(Status::Complete(count + bytes.pos()));
+            result = Ok(Status::Complete((count + bytes.pos(), header_position_vec)));
             break;
         } else if !is_header_name_token(b) {
             return Err(Error::HeaderName);
@@ -837,11 +845,13 @@ fn parse_headers_iter_uninit<'a, 'b>(
             None => break 'headers
         };
 
+        let header_name_from = count;
         // parse header name until colon
         let header_name: &str = 'name: loop {
             let b = next!(bytes);
             if b == b':' {
                 count += bytes.pos();
+                // header_name_from = count;
                 let _name = unsafe {
                     str::from_utf8_unchecked(bytes.slice_skip(1))
                 };
@@ -851,6 +861,7 @@ fn parse_headers_iter_uninit<'a, 'b>(
                     return Err(Error::HeaderName);
                 }
                 count += bytes.pos();
+                // header_name_from = count;
                 let _name = unsafe { str::from_utf8_unchecked(bytes.slice_skip(1)) };
                 // eat white space between name and colon
                 'whitespace_before_colon: loop {
@@ -870,6 +881,7 @@ fn parse_headers_iter_uninit<'a, 'b>(
             }
         };
 
+        let header_name_to = count;
         let mut b;
 
         let value_slice = 'value: loop {
@@ -995,6 +1007,7 @@ fn parse_headers_iter_uninit<'a, 'b>(
             }
         };
 
+        let value_to = count;
         // trim trailing whitespace in the header
         let header_value = if let Some(last_visible) = value_slice
             .iter()
@@ -1013,6 +1026,7 @@ fn parse_headers_iter_uninit<'a, 'b>(
             value: header_value,
         });
         autoshrink.num_headers += 1;
+        header_position_vec.push((header_name_from, header_name_to, value_to));
     }
 
     result
